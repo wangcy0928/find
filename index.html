@@ -64,9 +64,12 @@ const LOCK_DEG = 7;          // within this many degrees = "facing it"
 const LOCK_MS = 700;         // must stay facing it this long before announcing
 const AI_GAP_MS = 150;       // pause between requests per worker (2 workers)
 const LOCAL_EVERY = 150;     // ms between on-device detections
-const FIX_TTL_AI = 6000;     // trust an AI fix this long (gyro keeps it current)
+const FIX_TTL_AI = 6000;     // trust an AI fix this long without gyro
+const FIX_TTL_GYRO = 20000;  // with gyro the bearing stays good much longer
+const MAX_TURN_FOR_PHOTO = 50; // deg/s: turning faster than this blurs the photo, so wait
+const TRACK_EVERY = 60;      // ms between on-device tracking steps (between AI answers)
 const FIX_TTL_LOCAL = 1500;
-const LOST_MS = 5000;        // no sighting this long while locked = lost
+const LOST_MS = 10000;       // no sighting this long while locked = lost
 const GIVE_UP_DEG = 340;     // searched a full circle without seeing it
 const GIVE_UP_MS = 35000;
 const ARRIVE_STEPS = 1;
@@ -129,7 +132,7 @@ const chimeArrive = () => { tone(1320, .15, .3); tone(1760, .15, .3, 0, "sine", 
 // ---------- heading: which way the camera faces (degrees, + = turned right) ----------
 // From deviceorientation (gyro-fused on iPhone). Uses the full rotation matrix, so it
 // stays stable when the phone is held upright, where Euler angles are degenerate.
-let rawYaw = 0, gyroOK = false, lastHeading = null, lastOri = 0;
+let rawYaw = 0, gyroOK = false, lastHeading = null, lastOri = 0, turnRate = 0;
 const yawSign = 1;
 function onOrient(e) {
   if (e.alpha === null || e.beta === null || e.gamma === null) return;
@@ -142,6 +145,8 @@ function onOrient(e) {
   if (lastHeading !== null) {
     let d = h - lastHeading; d = ((d + 540) % 360) - 180;   // unwrap
     rawYaw += d;
+    const dt = Math.max(.005, (performance.now() - lastOri) / 1000);
+    turnRate = turnRate * .7 + Math.abs(d / dt) * .3;
     if (state.mode === "search") state.turned += Math.abs(d);
   }
   lastHeading = h; gyroOK = true; lastOri = performance.now();
@@ -157,11 +162,13 @@ const state = {
   prevFix: null, lastSeen: 0, startedAt: 0, turned: 0,
   centeredSince: 0, lastSteps: null, lastDistSaid: 0, lastTarget: ""
 };
-function hfov() { return video.videoWidth && video.videoWidth < video.videoHeight ? 42 : 64; }
-function vfov() { return video.videoWidth && video.videoWidth < video.videoHeight ? 64 : 42; }
+const LONG_FOV = 64;
+function fovOf(px, longPx) { return 2 * Math.atan(Math.tan(LONG_FOV * Math.PI / 360) * px / longPx) * 360 / Math.PI; }
+function hfov() { const w = video.videoWidth || 4, h = video.videoHeight || 3; return fovOf(w, Math.max(w, h)); }
+function vfov() { const w = video.videoWidth || 4, h = video.videoHeight || 3; return fovOf(h, Math.max(w, h)); }
 function offsetDeg() {   // where the target is now, relative to straight ahead (+ = right)
   const f = state.fix; if (!f) return null;
-  const ttl = f.local ? FIX_TTL_LOCAL : FIX_TTL_AI;
+  const ttl = f.local ? FIX_TTL_LOCAL : gyroOK ? FIX_TTL_GYRO : FIX_TTL_AI;
   if (performance.now() - f.at > ttl) return null;
   return (yawSign * f.raw + f.m) - yaw();
 }
@@ -175,8 +182,8 @@ function sideWords(off) {
 function startFind(raw) {
   const t = cleanTarget(raw);
   if (!t) { say("Say what you want to find, like: find the door."); return; }
-  state.session++;
-  Object.assign(state, { mode: "search", target: t, coco: COCO[t] || COCO[t.replace(/s$/, "")] || null,
+  state.session++; track = null;
+  Object.assign(state, { aiMisses: 0, mode: "search", target: t, coco: COCO[t] || COCO[t.replace(/s$/, "")] || null,
     fix: null, prevFix: null, lastSeen: 0, startedAt: performance.now(), turned: 0, centeredSince: 0,
     lastSteps: null, lastDistSaid: 0, lastTarget: t, everSeen: false });
   status("Finding " + t, "busy"); show("Finding: " + t);
@@ -184,7 +191,7 @@ function startFind(raw) {
   if (!state.coco || !detector) aiLoop(state.session);
 }
 function stopFind(msg) {
-  state.mode = "idle"; state.session++; state.fix = null;
+  state.mode = "idle"; state.session++; state.fix = null; track = null;
   status("Hold the screen to ask", "on");
   if (msg) say(msg);
   setTimeout(() => { if (state.mode === "idle") show(""); }, 3000);
@@ -203,13 +210,33 @@ function withArticle(t) { return /^(the |a |an |room |exit$)/.test(t) || /\d/.te
 function accept(fix, session) {
   if (session !== state.session || state.mode === "idle") return;
   if (!fix) {   // looked, not seen
-    // only forget it if it should have been in the photo; if they've turned away, the gyro still knows where it is
+    if (track && performance.now() - track.lastHit < 600) return;     // tracker still sees it: trust that
+    state.aiMisses = (state.aiMisses || 0) + 1;
+    // forget it only if it should have been in view twice in a row; if they turned away, the gyro still knows
     const off = offsetDeg();
-    if (state.fix && !state.fix.local && off !== null && Math.abs(off) < hfov() / 2) state.fix = null;
+    if (state.aiMisses >= 2 && state.fix && !state.fix.local && off !== null && Math.abs(off) < hfov() / 3) { state.fix = null; track = null; }
     return;
   }
+  state.aiMisses = 0;
   const old = state.fix;
   if (old && !fix.local && fix.cap < (old.cap || 0)) return;          // older photo than what we have
+  // smooth the distance
+  if (fix.steps && old && old.steps) fix.steps = Math.round((old.dist || old.steps) * .5 + fix.steps * .5);
+  fix.dist = fix.steps && old && old.dist ? old.dist * .5 + fix.steps * .5 : fix.steps;
+  if (fix.box && (fix.box.h > .7 || fix.box.w > .8)) { fix.steps = 1; fix.dist = 1; }   // fills the view = you're there
+  if (!fix.local && fix.snap) {
+    // tracker already following it and agrees? keep tracker position, take the new size/distance/label
+    const curOff = offsetDeg();
+    const tb = track && curOff !== null && performance.now() - track.lastHit < 400 ? yaw() + curOff : null;
+    const bNew = fix.raw + fix.m;
+    if (tb !== null && Math.abs(tb - bNew) < 8) {
+      Object.assign(state.fix, { steps: fix.steps, dist: fix.dist, label: fix.label, note: fix.note, cap: fix.cap,
+        box: fix.box ? { ...fix.box, x: state.fix.box ? state.fix.box.x + state.fix.box.w / 2 - fix.box.w / 2 : fix.box.x } : state.fix.box });
+      state.lastSeen = performance.now();
+      return;
+    }
+    initTrack(fix);
+  }
   if (old && !old.local && !fix.local && performance.now() - old.at < 3000) {
     const bOld = old.raw + old.m, bNew = fix.raw + fix.m;
     if (Math.abs(bNew - bOld) < 15) fix.m = (bOld * .4 + bNew * .6) - fix.raw;   // damp jumps
@@ -222,16 +249,20 @@ function accept(fix, session) {
 function aiLoop(session) { aiWorker(session); setTimeout(() => aiWorker(session), 450); }
 async function aiWorker(session) {
   while (session === state.session && state.mode !== "idle") {
-    const cap = performance.now(), raw = rawYaw, W = 512, H = Math.round(W * video.videoHeight / video.videoWidth);
+    // a photo taken mid-swing is blurry; wait (up to 0.4 s) for the turn to slow down
+    for (let t = 0; t < 4 && gyroOK && turnRate > MAX_TURN_FOR_PHOTO; t++) await new Promise(r => setTimeout(r, 100));
+    if (session !== state.session) return;
+    const cap = performance.now(), raw = rawYaw, W = 640, H = Math.round(W * video.videoHeight / video.videoWidth);
     const c = document.createElement("canvas"); c.width = W; c.height = H;
     c.getContext("2d").drawImage(video, 0, 0, W, H);
-    const image = c.toDataURL("image/jpeg", .65);
+    const snap = graySnap(c);
+    const image = c.toDataURL("image/jpeg", .7);
     try {
       const r = await fetch("/api/locate", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image, target: state.target }) });
       const j = await r.json();
       if (j.error) { if (session === state.session) { stopFind("Sorry, the server had a problem."); show(j.error); } return; }
-      accept(j.found ? { m: (j.x - .5) * hfov(), raw, cap, at: performance.now(), local: false,
+      accept(j.found ? { m: (j.x - .5) * hfov(), raw, cap, snap, at: performance.now(), local: false,
         box: j.w ? { x: j.x - j.w / 2, y: j.y - j.h / 2, w: j.w, h: j.h } : null,
         steps: j.steps, label: j.label || state.target, note: j.note } : null, session);
     } catch (e) {
@@ -240,6 +271,74 @@ async function aiWorker(session) {
     }
     await new Promise(r => setTimeout(r, AI_GAP_MS));
   }
+}
+
+// ---------- on-device tracker ----------
+// Between AI answers (~0.5 s apart, ~1 s old), follow the found thing frame-to-frame by matching a
+// small grey patch of it. This is what keeps the beeps precise and continuous while you walk up to it.
+const TW = 160;
+const tcv = document.createElement("canvas"), tctx = tcv.getContext("2d", { willReadFrequently: true });
+let track = null, lastTrack = 0;
+function graySnap(src) {
+  const w = TW, h = Math.round(TW * src.height / src.width) || Math.round(TW * .75);
+  tcv.width = w; tcv.height = h; tctx.drawImage(src, 0, 0, w, h);
+  const d = tctx.getImageData(0, 0, w, h).data, g = new Uint8Array(w * h);
+  for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
+  return { g, w, h };
+}
+function patch(sn, cx, cy, tw, th) {
+  const x0 = Math.round(cx - tw / 2), y0 = Math.round(cy - th / 2);
+  if (x0 < 0 || y0 < 0 || x0 + tw > sn.w || y0 + th > sn.h) return null;
+  const t = new Float32Array(tw * th); let m = 0;
+  for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) { const v = sn.g[(y0 + y) * sn.w + x0 + x]; t[y * tw + x] = v; m += v; }
+  m /= t.length; for (let i = 0; i < t.length; i++) t[i] -= m;
+  return t;
+}
+function initTrack(fix) {
+  if (!fix.box || !fix.snap) { track = null; return; }
+  const sn = fix.snap, b = fix.box;
+  const tw = Math.max(12, Math.min(36, Math.round(b.w * sn.w * .6)));
+  const th = Math.max(12, Math.min(36, Math.round(b.h * sn.h * .6)));
+  let cx = (b.x + b.w / 2) * sn.w, cy = (b.y + b.h / 2) * sn.h;
+  cx = Math.max(tw / 2 + 1, Math.min(sn.w - tw / 2 - 1, cx)); cy = Math.max(th / 2 + 1, Math.min(sn.h - th / 2 - 1, cy));
+  const tpl = patch(sn, cx, cy, tw, th);
+  track = tpl ? { tpl, tw, th, cx, cy, raw: fix.raw, misses: 0, lastHit: performance.now(), fresh: true } : null;
+}
+function score(sn, tr, cx, cy, best) {
+  const tw = tr.tw, th = tr.th, x0 = Math.round(cx - tw / 2), y0 = Math.round(cy - th / 2);
+  if (x0 < 0 || y0 < 0 || x0 + tw > sn.w || y0 + th > sn.h) return Infinity;
+  let m = 0, n = 0;
+  for (let y = 0; y < th; y += 2) for (let x = 0; x < tw; x += 2) { m += sn.g[(y0 + y) * sn.w + x0 + x]; n++; }
+  m /= n; let sad = 0; const lim = best * n;
+  for (let y = 0; y < th; y += 2) {
+    for (let x = 0; x < tw; x += 2) sad += Math.abs(sn.g[(y0 + y) * sn.w + x0 + x] - m - tr.tpl[y * tw + x]);
+    if (sad > lim) return Infinity;   // can't beat the best so far
+  }
+  return sad / n;
+}
+function trackStep(now) {
+  if (!track || !state.fix || state.fix.local || now - lastTrack < TRACK_EVERY || video.readyState < 2) return;
+  lastTrack = now;
+  const sn = graySnap(video), tr = track, pxPerDeg = sn.w / hfov();
+  // predict where it moved because the user turned
+  const px = tr.cx - (yaw() - tr.raw) * pxPerDeg, py = tr.cy;
+  if (px < tr.tw / 2 || px > sn.w - tr.tw / 2) { tr.raw = yaw(); tr.cx = px; return; }   // off screen: gyro holds it
+  const R = tr.fresh ? 26 : 16;
+  let best = 40, bx = 0, by = 0;
+  for (let dy = -R; dy <= R; dy += 2) for (let dx = -R; dx <= R; dx += 2) {
+    const sc = score(sn, tr, px + dx, py + dy, best); if (sc < best) { best = sc; bx = px + dx; by = py + dy; }
+  }
+  if (best < 40) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    const sc = score(sn, tr, bx + dx, by + dy, best); if (sc < best) { best = sc; bx += dx; by += dy; dx = dy = 2; }
+  }
+  if (best > 22) { if (++tr.misses > 10) track = null; return; }
+  tr.misses = 0; tr.fresh = false; tr.cx = bx; tr.cy = by; tr.raw = yaw(); tr.lastHit = now;
+  // slowly adapt the patch so it keeps matching as the thing gets bigger
+  const np = patch(sn, bx, by, tr.tw, tr.th);
+  if (np) for (let i = 0; i < np.length; i++) tr.tpl[i] = tr.tpl[i] * .85 + np[i] * .15;
+  const f = state.fix;
+  f.m = (bx / sn.w - .5) * hfov(); f.raw = yaw(); f.at = now; state.lastSeen = now;
+  if (f.box) { f.box = { ...f.box, x: bx / sn.w - f.box.w / 2, y: by / sn.h - f.box.h / 2 }; }
 }
 
 // on-device path for common objects
@@ -285,14 +384,19 @@ function guide(now) {
   }
 
   // in view: faster + higher as you face it, panned to its side
-  const a = Math.min(45, Math.abs(off));
+  const a = Math.min(45, Math.abs(off)), f = state.fix;
   if (now >= nextBeep) {
     const centered = a < LOCK_DEG;
-    tone(centered ? 1320 : 600 + (1 - a / 45) * 500, centered ? .07 : .05, .28 * quiet, off / 25, centered ? "triangle" : "sine");
-    nextBeep = now + (centered ? 140 : 160 + (a / 45) * 600);
+    const seenRecently = now - state.lastSeen < 2000;   // otherwise only the gyro is holding it: softer
+    const vol = (seenRecently ? .28 : .14) * quiet;
+    tone(centered ? 1320 : 600 + (1 - a / 45) * 500, centered ? .07 : .05, vol, off / 25, centered ? "triangle" : "sine");
+    if (state.mode === "locked") {
+      // parking-sensor style: closer = faster; drifting off-centre adds a little delay
+      const d = Math.max(1, Math.min(10, f.dist || f.steps || 6));
+      nextBeep = now + 110 + (d - 1) / 9 * 650 + (centered ? 0 : 120);
+    } else nextBeep = now + (centered ? 140 : 160 + (a / 45) * 600);
   }
 
-  const f = state.fix;
   if (a < LOCK_DEG) { if (!state.centeredSince) state.centeredSince = now; } else state.centeredSince = 0;
 
   if (state.mode === "search" && state.centeredSince && now - state.centeredSince > LOCK_MS) {
@@ -305,7 +409,7 @@ function guide(now) {
   }
 
   if (state.mode === "locked" && f.steps) {
-    if (f.steps <= ARRIVE_STEPS) {
+    if ((f.dist || f.steps) <= ARRIVE_STEPS + .3) {
       chimeArrive(); stopFind(`You're at the ${f.label}.`); show(`At the ${f.label}`, true); return;
     }
     if (now - state.lastDistSaid > 4000 && f.steps !== state.lastSteps && !speaking()) {
@@ -361,7 +465,7 @@ function draw() {
 function loop() {
   const now = performance.now();
   cameraWatchdog(now);
-  if (state.mode !== "idle") { localDetect(now); guide(now); }
+  if (state.mode !== "idle") { localDetect(now); trackStep(now); guide(now); }
   draw();
   requestAnimationFrame(loop);
 }
@@ -381,7 +485,7 @@ $("go").onclick = async e => {
   $("start").style.display = "none";
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 960 }, aspectRatio: { ideal: 4 / 3 } }, audio: false });
     video.muted = true; video.srcObject = stream; await video.play();
     video.addEventListener("pause", () => video.play().catch(() => {}));
     stream.getVideoTracks()[0].addEventListener("unmute", () => video.play().catch(() => {}));

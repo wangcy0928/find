@@ -8,11 +8,13 @@ const PROMPT = (target) =>
   "You are the eyes of a blind person who is turning slowly to find something. " +
   `They are looking for: "${target}". ` +
   "Look at the photo and answer with ONE JSON object and nothing else:\n" +
-  '{"found": true|false, "x": 0-1, "y": 0-1, "w": 0-1, "h": 0-1, "steps": number|null, "label": "...", "note": "..."}\n' +
-  "- found: true only if that thing (or an obvious match, e.g. an EXIT sign for 'exit', a doorway for 'door') is clearly visible.\n" +
+  '{"found": true|false, "conf": 0-1, "x": 0-1, "y": 0-1, "w": 0-1, "h": 0-1, "steps": number|null, "label": "...", "note": "..."}\n' +
+  "- found: true if that thing (or an obvious match, e.g. an EXIT sign for 'exit', a doorway for 'door') is visible, " +
+  "even if small, far away, partly cut off at the edge, slightly blurry, or so close it fills most of the view.\n" +
+  "- conf: how sure you are it is the right thing (0-1).\n" +
   "- x, y: centre of the thing as a fraction of image width / height (0 = left/top, 1 = right/bottom).\n" +
   "- w, h: its size as a fraction of image width / height.\n" +
-  "- steps: rough walking distance in normal steps (1 step = 0.7 m), or null if you cannot tell.\n" +
+  "- steps: walking distance in normal steps (1 step = 0.7 m). Judge from its size in the image (a door filling the height is 1-2 steps; a door half the image height is about 4-5 steps). Never null if found.\n" +
   "- label: 1-4 words naming exactly what you found, e.g. \"glass door\", \"EXIT sign\", \"Room 706 door\".\n" +
   "- note: at most 8 words that matter for reaching it (\"two steps down first\", \"door is closed\"), or \"\".\n" +
   "If it is not visible, return {\"found\": false, \"note\": \"\"}. If there are several, pick the nearest.";
@@ -69,10 +71,12 @@ module.exports = async function handler(req, res) {
     const raw = data.choices && data.choices[0] && data.choices[0].message.content;
     const j = parse(raw) || {};
     const x = clamp01(j.x), y = clamp01(j.y);
-    const found = !!j.found && x !== null && y !== null;
+    const conf = Number.isFinite(Number(j.conf)) ? Number(j.conf) : (j.found ? .6 : 0);
+    const found = !!j.found && conf >= .35 && x !== null && y !== null;
     const steps = Number(j.steps);
     return res.status(200).json({
       found,
+      conf: Math.round(conf * 100) / 100,
       x: found ? x : null,
       y: found ? y : null,
       w: found ? clamp01(j.w) : null,
