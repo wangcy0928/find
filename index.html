@@ -302,7 +302,9 @@ function initTrack(fix) {
   let cx = (b.x + b.w / 2) * sn.w, cy = (b.y + b.h / 2) * sn.h;
   cx = Math.max(tw / 2 + 1, Math.min(sn.w - tw / 2 - 1, cx)); cy = Math.max(th / 2 + 1, Math.min(sn.h - th / 2 - 1, cy));
   const tpl = patch(sn, cx, cy, tw, th);
-  track = tpl ? { tpl, tw, th, cx, cy, raw: fix.raw, misses: 0, lastHit: performance.now(), fresh: true } : null;
+  // a flat patch (plain wall, blank door) matches anywhere: don't track it, rely on AI + gyro
+  let tex = 0; if (tpl) { for (const v of tpl) tex += Math.abs(v); tex /= tpl.length; }
+  track = tpl && tex >= 8 ? { tpl, tw, th, cx, cy, raw: fix.raw, misses: 0, lastHit: performance.now(), fresh: true } : null;
 }
 function score(sn, tr, cx, cy, best) {
   const tw = tr.tw, th = tr.th, x0 = Math.round(cx - tw / 2), y0 = Math.round(cy - th / 2);
@@ -563,7 +565,7 @@ document.addEventListener("keydown", e => {
   if (e.key === "Escape") stopFind("Stopped.");
 });
 document.addEventListener("keyup", e => { if (e.key === " " && listening) finishListening(); });
-window.__find = { route, state }; // for testing from the console
+window.__find = { route, state }; // for testing from the console // for testing from the console
 </script>
 </body>
 </html>
