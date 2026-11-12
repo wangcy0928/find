@@ -62,7 +62,7 @@ import { ObjectDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@m
 const PRESS_MS = 350;        // press longer than this = talk, shorter = tap
 const LOCK_DEG = 7;          // within this many degrees = "facing it"
 const LOCK_MS = 700;         // must stay facing it this long before announcing
-const AI_GAP_MS = 500;       // min gap between AI requests
+const AI_GAP_MS = 150;       // pause between requests per worker (2 workers)
 const LOCAL_EVERY = 150;     // ms between on-device detections
 const FIX_TTL_AI = 6000;     // trust an AI fix this long (gyro keeps it current)
 const FIX_TTL_LOCAL = 1500;
@@ -91,7 +91,18 @@ const HEIGHT_M = { person:1.7, chair:.9, "dining table":.75, couch:.8, bench:.8,
 
 const $ = id => document.getElementById(id);
 const video = $("cam"), cv = $("fx"), cx = cv.getContext("2d");
-let actx, detector = null, listening = false;
+let actx, detector = null, listening = false, stream = null, lastFrameAt = 0, lastVT = -1, lastKick = 0;
+// iOS Safari can pause/freeze the camera preview when speech starts. Keep it running.
+function cameraWatchdog(now) {
+  if (!stream) return;
+  if (video.currentTime !== lastVT) { lastVT = video.currentTime; lastFrameAt = now; return; }
+  const stuck = now - lastFrameAt;
+  if (stuck > 400 && now - lastKick > 400) {
+    lastKick = now;
+    if (stuck > 1500) { video.srcObject = null; video.srcObject = stream; }
+    video.muted = true; video.play().catch(() => {});
+  }
+}
 
 function status(t, cls) { $("statusText").textContent = t; $("dot").className = cls || ""; }
 function show(text, locked) {
@@ -115,32 +126,28 @@ function tone(freq, dur, vol, pan = 0, type = "sine", when = 0) {
 const chimeLock = () => { tone(880, .15, .3); tone(1320, .25, .3, 0, "sine", .12); };
 const chimeArrive = () => { tone(1320, .15, .3); tone(1760, .15, .3, 0, "sine", .13); tone(2200, .35, .3, 0, "sine", .26); };
 
-// ---------- gyro: how far has the user turned since a photo was taken ----------
-// rawYaw integrates rotation about the gravity axis. Its sign differs between devices,
-// so yawSign is learned from consecutive sightings (see learnSign).
-let rawYaw = 0, yawSign = 1, gyroOK = false, grav = { x: 0, y: -9.8, z: 0 }, lastMotion = 0;
-function onMotion(e) {
-  const now = performance.now(), dt = lastMotion ? Math.min(.1, (now - lastMotion) / 1000) : 0; lastMotion = now;
-  const a = e.accelerationIncludingGravity, r = e.rotationRate;
-  if (a && a.x !== null) { const k = .1; grav.x += (a.x - grav.x) * k; grav.y += (a.y - grav.y) * k; grav.z += (a.z - grav.z) * k; }
-  if (!r || r.alpha === null) return;
-  const gn = Math.hypot(grav.x, grav.y, grav.z) || 1;
-  // rotationRate: alpha about z, beta about x, gamma about y (deg/s)
-  const yawRate = (r.beta * grav.x + r.gamma * grav.y + r.alpha * grav.z) / gn;
-  rawYaw += yawRate * dt; gyroOK = true;
-  if (state.mode === "search") state.turned += Math.abs(yawRate * dt);
+// ---------- heading: which way the camera faces (degrees, + = turned right) ----------
+// From deviceorientation (gyro-fused on iPhone). Uses the full rotation matrix, so it
+// stays stable when the phone is held upright, where Euler angles are degenerate.
+let rawYaw = 0, gyroOK = false, lastHeading = null, lastOri = 0;
+const yawSign = 1;
+function onOrient(e) {
+  if (e.alpha === null || e.beta === null || e.gamma === null) return;
+  const r = Math.PI / 180, a = e.alpha * r, b = e.beta * r, g = e.gamma * r;
+  const ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b), cg = Math.cos(g), sg = Math.sin(g);
+  // camera looks along device -z; R = Rz(a)·Rx(b)·Ry(g); v = R·(0,0,-1)
+  const vx = -(ca * sg + sa * sb * cg), vy = -(sa * sg - ca * sb * cg);
+  if (Math.hypot(vx, vy) < .2) return;           // pointing at floor/ceiling: heading meaningless
+  const h = Math.atan2(vx, vy) / r;              // clockwise from alpha's zero
+  if (lastHeading !== null) {
+    let d = h - lastHeading; d = ((d + 540) % 360) - 180;   // unwrap
+    rawYaw += d;
+    if (state.mode === "search") state.turned += Math.abs(d);
+  }
+  lastHeading = h; gyroOK = true; lastOri = performance.now();
 }
-const yaw = () => yawSign * rawYaw;
-let signVotes = 0;
-function learnSign(prev, cur) {
-  if (!gyroOK || !prev) return;
-  const dr = cur.raw - prev.raw;
-  if (Math.abs(dr) < 10 || cur.at - prev.at > 4000) return;
-  const keep = Math.abs((yawSign * cur.raw + cur.m) - (yawSign * prev.raw + prev.m));
-  const flip = Math.abs((-yawSign * cur.raw + cur.m) - (-yawSign * prev.raw + prev.m));
-  signVotes = flip + 5 < keep ? signVotes + 1 : 0;
-  if (signVotes >= 2) { yawSign = -yawSign; signVotes = 0; }
-}
+const yaw = () => rawYaw;
+function learnSign() {}
 
 // ---------- search state ----------
 const state = {
@@ -201,35 +208,37 @@ function accept(fix, session) {
     if (state.fix && !state.fix.local && off !== null && Math.abs(off) < hfov() / 2) state.fix = null;
     return;
   }
-  learnSign(state.prevFix, fix);
+  const old = state.fix;
+  if (old && !fix.local && fix.cap < (old.cap || 0)) return;          // older photo than what we have
+  if (old && !old.local && !fix.local && performance.now() - old.at < 3000) {
+    const bOld = old.raw + old.m, bNew = fix.raw + fix.m;
+    if (Math.abs(bNew - bOld) < 15) fix.m = (bOld * .4 + bNew * .6) - fix.raw;   // damp jumps
+  }
   state.prevFix = fix; state.fix = fix; state.lastSeen = fix.at;
   if (state.mode === "search" && !state.everSeen) { state.everSeen = true; tone(990, .08, .25, fix.m / 25); }
 }
 
-// AI path: one request in flight, back-to-back
-async function aiLoop(session) {
-  let last = 0;
+// AI path: two workers, staggered, so a fresh answer lands about every half second
+function aiLoop(session) { aiWorker(session); setTimeout(() => aiWorker(session), 450); }
+async function aiWorker(session) {
   while (session === state.session && state.mode !== "idle") {
-    const wait = AI_GAP_MS - (performance.now() - last);
-    if (wait > 0) await new Promise(r => setTimeout(r, wait));
-    if (session !== state.session) return;
-    last = performance.now();
-    const raw = rawYaw, W = 640, H = Math.round(W * video.videoHeight / video.videoWidth);
+    const cap = performance.now(), raw = rawYaw, W = 512, H = Math.round(W * video.videoHeight / video.videoWidth);
     const c = document.createElement("canvas"); c.width = W; c.height = H;
     c.getContext("2d").drawImage(video, 0, 0, W, H);
-    const image = c.toDataURL("image/jpeg", .7);
+    const image = c.toDataURL("image/jpeg", .65);
     try {
       const r = await fetch("/api/locate", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image, target: state.target }) });
       const j = await r.json();
       if (j.error) { if (session === state.session) { stopFind("Sorry, the server had a problem."); show(j.error); } return; }
-      accept(j.found ? { m: (j.x - .5) * hfov(), raw, at: performance.now(), local: false,
+      accept(j.found ? { m: (j.x - .5) * hfov(), raw, cap, at: performance.now(), local: false,
         box: j.w ? { x: j.x - j.w / 2, y: j.y - j.h / 2, w: j.w, h: j.h } : null,
         steps: j.steps, label: j.label || state.target, note: j.note } : null, session);
     } catch (e) {
-      if (session === state.session) { stopFind("No connection. Try again."); }
+      if (session === state.session) stopFind("No connection. Try again.");
       return;
     }
+    await new Promise(r => setTimeout(r, AI_GAP_MS));
   }
 }
 
@@ -249,7 +258,7 @@ function localDetect(now) {
   const box = { x: b.originX / vw, y: b.originY / vh, w: b.width / vw, h: b.height / vh };
   const realH = HEIGHT_M[state.coco] || .5;
   const meters = realH / (box.h * 2 * Math.tan(vfov() * Math.PI / 360));
-  accept({ m: (box.x + box.w / 2 - .5) * hfov(), raw: rawYaw, at: now, local: true, box,
+  accept({ m: (box.x + box.w / 2 - .5) * hfov(), raw: rawYaw, cap: now, at: now, local: true, box,
     steps: Math.max(1, Math.round(meters / STEP_M)), label: state.target, note: "" }, state.session);
 }
 
@@ -351,6 +360,7 @@ function draw() {
 
 function loop() {
   const now = performance.now();
+  cameraWatchdog(now);
   if (state.mode !== "idle") { localDetect(now); guide(now); }
   draw();
   requestAnimationFrame(loop);
@@ -362,17 +372,19 @@ $("go").onclick = async e => {
   actx = new (window.AudioContext || window.webkitAudioContext)();
   // iOS asks for motion permission; must be inside the tap
   try {
-    if (window.DeviceMotionEvent && typeof DeviceMotionEvent.requestPermission === "function") {
-      const p = await DeviceMotionEvent.requestPermission();
-      if (p === "granted") addEventListener("devicemotion", onMotion);
-    } else addEventListener("devicemotion", onMotion);
+    if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === "function") {
+      const p = await DeviceOrientationEvent.requestPermission();
+      if (p === "granted") addEventListener("deviceorientation", onOrient);
+    } else addEventListener("deviceorientation", onOrient);
   } catch (err) {}
   say("Starting camera.");
   $("start").style.display = "none";
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
+    stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
-    video.srcObject = stream; await video.play();
+    video.muted = true; video.srcObject = stream; await video.play();
+    video.addEventListener("pause", () => video.play().catch(() => {}));
+    stream.getVideoTracks()[0].addEventListener("unmute", () => video.play().catch(() => {}));
   } catch (err) { status("Camera blocked"); say("I can't open the camera. Check Safari camera permission."); return; }
   status("Hold the screen to ask", "on");
   say("Ready. Hold the screen and say what you want to find.");
@@ -380,9 +392,10 @@ $("go").onclick = async e => {
   // on-device detector loads in the background; until then everything goes to the AI
   try {
     const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
-    detector = await ObjectDetector.createFromOptions(fs, {
-      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite", delegate: "GPU" },
+    const opts = d => ({ baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite", delegate: d },
       runningMode: "VIDEO", scoreThreshold: .35, maxResults: 6 });
+    try { detector = await ObjectDetector.createFromOptions(fs, opts("GPU")); }
+    catch (e) { detector = await ObjectDetector.createFromOptions(fs, opts("CPU")); }
   } catch (err) { detector = null; }
 };
 
