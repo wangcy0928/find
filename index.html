@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Find</title>
+<style>
+  :root { --amber:#ffb000; --go:#30d158; --ink:#fff; --bg:#000; --mic:#ff3b30; }
+  * { box-sizing:border-box; margin:0; padding:0; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+  html, body { height:100%; background:var(--bg); color:var(--ink);
+    font-family:-apple-system, "SF Pro Text", system-ui, sans-serif; overflow:hidden; touch-action:none; }
+  #stage { position:fixed; inset:0; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  #status { position:fixed; top:calc(env(safe-area-inset-top) + 14px); left:16px; right:16px;
+    font-size:15px; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
+    display:flex; align-items:center; gap:8px; text-shadow:0 1px 4px #000; pointer-events:none; }
+  #dot { width:10px; height:10px; border-radius:50%; background:#666; flex:none; }
+  #dot.on { background:var(--go); } #dot.busy { background:var(--amber); animation:pulse .8s infinite alternate; }
+  #dot.mic { background:var(--mic); animation:pulse .4s infinite alternate; }
+  @keyframes pulse { to { opacity:.3; } }
+  #heard { position:fixed; top:calc(env(safe-area-inset-top) + 42px); left:16px; right:16px;
+    font-size:20px; font-style:italic; color:#ddd; text-shadow:0 1px 4px #000; pointer-events:none; }
+  #answer { position:fixed; left:16px; right:16px; bottom:calc(env(safe-area-inset-bottom) + 24px);
+    font-size:28px; line-height:1.18; font-weight:700; background:rgba(0,0,0,.75);
+    padding:18px 20px; border-radius:18px; border:2px solid var(--amber); display:none; pointer-events:none; }
+  #answer.locked { border-color:var(--go); }
+  #listening { position:fixed; inset:0; border:10px solid var(--mic); display:none; pointer-events:none; }
+  #start { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:20px; background:#000; z-index:5; padding:24px; text-align:center; }
+  #start h1 { font-size:44px; }
+  #start ul { list-style:none; font-size:17px; color:#bbb; max-width:330px; line-height:1.45; text-align:left; }
+  #start li { margin:6px 0; } #start b { color:#fff; }
+  #start button { font-size:26px; font-weight:700; padding:28px 0; width:100%; max-width:340px;
+    border-radius:22px; border:none; background:var(--amber); color:#000; }
+  #foot { position:fixed; bottom:4px; width:100%; text-align:center; font-size:10px; color:#888; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="stage"><video id="cam" playsinline muted autoplay></video><canvas id="fx"></canvas></div>
+<div id="listening"></div>
+<div id="status"><span id="dot"></span><span id="statusText">Starting</span></div>
+<div id="heard"></div>
+<div id="answer" aria-live="polite"></div>
+
+<div id="start">
+  <h1>Find</h1>
+  <ul>
+    <li><b>Hold the screen</b> and say what you want: "Find the door", "Where's a chair?", "Exit".</li>
+    <li><b>Turn slowly.</b> Beeps get faster as you face it, and come from its side.</li>
+    <li>A chime and a voice tell you when you're facing it and how far it is.</li>
+    <li><b>Tap</b> to hear where it is. Say <b>"stop"</b> to end.</li>
+  </ul>
+  <button id="go" aria-label="Start. Then hold the screen and say what you want to find.">Tap to start</button>
+</div>
+<div id="foot">Prototype for IPD 5900 at Penn · not a mobility aid</div>
+
+<script type="module">
+import { ObjectDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------- tuning ----------
+const PRESS_MS = 350;        // press longer than this = talk, shorter = tap
+const LOCK_DEG = 7;          // within this many degrees = "facing it"
+const LOCK_MS = 700;         // must stay facing it this long before announcing
+const AI_GAP_MS = 500;       // min gap between AI requests
+const LOCAL_EVERY = 150;     // ms between on-device detections
+const FIX_TTL_AI = 6000;     // trust an AI fix this long (gyro keeps it current)
+const FIX_TTL_LOCAL = 1500;
+const LOST_MS = 5000;        // no sighting this long while locked = lost
+const GIVE_UP_DEG = 340;     // searched a full circle without seeing it
+const GIVE_UP_MS = 35000;
+const ARRIVE_STEPS = 1;
+const STEP_M = 0.7;
+
+// Things the phone can spot on its own (fast, no network). Anything else goes to the AI.
+const COCO = {
+  chair:"chair", chairs:"chair", seat:"chair", person:"person", someone:"person", people:"person", man:"person", woman:"person",
+  table:"dining table", desk:"dining table", couch:"couch", sofa:"couch", bench:"bench", bed:"bed",
+  toilet:"toilet", sink:"sink", fridge:"refrigerator", refrigerator:"refrigerator", microwave:"microwave", oven:"oven",
+  tv:"tv", television:"tv", laptop:"laptop", computer:"laptop", phone:"cell phone", "cell phone":"cell phone",
+  cup:"cup", mug:"cup", bottle:"bottle", "water bottle":"bottle", book:"book", clock:"clock", plant:"potted plant",
+  backpack:"backpack", bag:"handbag", handbag:"handbag", suitcase:"suitcase", umbrella:"umbrella",
+  bike:"bicycle", bicycle:"bicycle", car:"car", bus:"bus", "stop sign":"stop sign", "traffic light":"traffic light",
+  "fire hydrant":"fire hydrant", dog:"dog", cat:"cat", keyboard:"keyboard", mouse:"mouse", remote:"remote"
+};
+// rough real heights (m) used to guess distance from box size
+const HEIGHT_M = { person:1.7, chair:.9, "dining table":.75, couch:.8, bench:.8, bed:.6, toilet:.75, sink:.25,
+  refrigerator:1.7, microwave:.3, oven:.9, tv:.6, laptop:.25, "cell phone":.15, cup:.1, bottle:.25, book:.25,
+  clock:.3, "potted plant":.6, backpack:.5, handbag:.3, suitcase:.65, umbrella:1, bicycle:1, car:1.5, bus:3,
+  "stop sign":.75, "traffic light":.9, "fire hydrant":.7, dog:.5, cat:.3, keyboard:.05, mouse:.04, remote:.05 };
+
+const $ = id => document.getElementById(id);
+const video = $("cam"), cv = $("fx"), cx = cv.getContext("2d");
+let actx, detector = null, listening = false;
+
+function status(t, cls) { $("statusText").textContent = t; $("dot").className = cls || ""; }
+function show(text, locked) {
+  const a = $("answer"); a.textContent = text; a.className = locked ? "locked" : ""; a.style.display = text ? "block" : "none";
+}
+let lastSpoke = 0;
+function say(text, rate = 1.05) {
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text); u.rate = rate; u.lang = "en-US";
+  speechSynthesis.speak(u); lastSpoke = performance.now();
+}
+const speaking = () => speechSynthesis.speaking && performance.now() - lastSpoke < 15000;
+function tone(freq, dur, vol, pan = 0, type = "sine", when = 0) {
+  if (!actx) return;
+  const t = actx.currentTime + when;
+  const o = actx.createOscillator(), g = actx.createGain(), p = actx.createStereoPanner();
+  o.type = type; o.frequency.value = freq; p.pan.value = Math.max(-1, Math.min(1, pan));
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.001, t + dur);
+  o.connect(g).connect(p).connect(actx.destination); o.start(t); o.stop(t + dur);
+}
+const chimeLock = () => { tone(880, .15, .3); tone(1320, .25, .3, 0, "sine", .12); };
+const chimeArrive = () => { tone(1320, .15, .3); tone(1760, .15, .3, 0, "sine", .13); tone(2200, .35, .3, 0, "sine", .26); };
+
+// ---------- gyro: how far has the user turned since a photo was taken ----------
+// rawYaw integrates rotation about the gravity axis. Its sign differs between devices,
+// so yawSign is learned from consecutive sightings (see learnSign).
+let rawYaw = 0, yawSign = 1, gyroOK = false, grav = { x: 0, y: -9.8, z: 0 }, lastMotion = 0;
+function onMotion(e) {
+  const now = performance.now(), dt = lastMotion ? Math.min(.1, (now - lastMotion) / 1000) : 0; lastMotion = now;
+  const a = e.accelerationIncludingGravity, r = e.rotationRate;
+  if (a && a.x !== null) { const k = .1; grav.x += (a.x - grav.x) * k; grav.y += (a.y - grav.y) * k; grav.z += (a.z - grav.z) * k; }
+  if (!r || r.alpha === null) return;
+  const gn = Math.hypot(grav.x, grav.y, grav.z) || 1;
+  // rotationRate: alpha about z, beta about x, gamma about y (deg/s)
+  const yawRate = (r.beta * grav.x + r.gamma * grav.y + r.alpha * grav.z) / gn;
+  rawYaw += yawRate * dt; gyroOK = true;
+  if (state.mode === "search") state.turned += Math.abs(yawRate * dt);
+}
+const yaw = () => yawSign * rawYaw;
+let signVotes = 0;
+function learnSign(prev, cur) {
+  if (!gyroOK || !prev) return;
+  const dr = cur.raw - prev.raw;
+  if (Math.abs(dr) < 10 || cur.at - prev.at > 4000) return;
+  const keep = Math.abs((yawSign * cur.raw + cur.m) - (yawSign * prev.raw + prev.m));
+  const flip = Math.abs((-yawSign * cur.raw + cur.m) - (-yawSign * prev.raw + prev.m));
+  signVotes = flip + 5 < keep ? signVotes + 1 : 0;
+  if (signVotes >= 2) { yawSign = -yawSign; signVotes = 0; }
+}
+
+// ---------- search state ----------
+const state = {
+  mode: "idle",           // idle | search | locked
+  target: "", coco: null, session: 0,
+  fix: null,              // { m: offset deg at capture, raw: rawYaw at capture, at, box, steps, label, note, local }
+  prevFix: null, lastSeen: 0, startedAt: 0, turned: 0,
+  centeredSince: 0, lastSteps: null, lastDistSaid: 0, lastTarget: ""
+};
+function hfov() { return video.videoWidth && video.videoWidth < video.videoHeight ? 42 : 64; }
+function vfov() { return video.videoWidth && video.videoWidth < video.videoHeight ? 64 : 42; }
+function offsetDeg() {   // where the target is now, relative to straight ahead (+ = right)
+  const f = state.fix; if (!f) return null;
+  const ttl = f.local ? FIX_TTL_LOCAL : FIX_TTL_AI;
+  if (performance.now() - f.at > ttl) return null;
+  return (yawSign * f.raw + f.m) - yaw();
+}
+function sideWords(off) {
+  const a = Math.abs(off);
+  if (a < LOCK_DEG) return "ahead";
+  const s = off < 0 ? "left" : "right";
+  return a < 20 ? "slightly " + s : a < 45 ? "to your " + s : "far to your " + s;
+}
+
+function startFind(raw) {
+  const t = cleanTarget(raw);
+  if (!t) { say("Say what you want to find, like: find the door."); return; }
+  state.session++;
+  Object.assign(state, { mode: "search", target: t, coco: COCO[t] || COCO[t.replace(/s$/, "")] || null,
+    fix: null, prevFix: null, lastSeen: 0, startedAt: performance.now(), turned: 0, centeredSince: 0,
+    lastSteps: null, lastDistSaid: 0, lastTarget: t, everSeen: false });
+  status("Finding " + t, "busy"); show("Finding: " + t);
+  say(`Looking for ${withArticle(t)}. Turn slowly.`);
+  if (!state.coco || !detector) aiLoop(state.session);
+}
+function stopFind(msg) {
+  state.mode = "idle"; state.session++; state.fix = null;
+  status("Hold the screen to ask", "on");
+  if (msg) say(msg);
+  setTimeout(() => { if (state.mode === "idle") show(""); }, 3000);
+}
+function cleanTarget(q) {
+  let s = q.toLowerCase().replace(/[.,!?]/g, " ").replace(/\s+/g, " ").trim();
+  s = s.replace(/^(please |can you |could you |help me |i want to |i need to |i'm looking for |i am looking for )+/, "");
+  s = s.replace(/^(find( me)?|where'?s|where is|where are|look for|search for|take me to|show me|go to|get me to)\s+/, "");
+  s = s.replace(/^(the|a|an|some|my|nearest|closest)\s+/, "").replace(/^(the|a|an)\s+/, "");
+  s = s.replace(/\s+(please|for me|here|nearby|around here)$/, "").trim();
+  return s.slice(0, 40);
+}
+function withArticle(t) { return /^(the |a |an |room |exit$)/.test(t) || /\d/.test(t) ? t : (/^[aeiou]/.test(t) ? "an " : "a ") + t; }
+
+// ---------- sightings ----------
+function accept(fix, session) {
+  if (session !== state.session || state.mode === "idle") return;
+  if (!fix) {   // looked, not seen
+    // only forget it if it should have been in the photo; if they've turned away, the gyro still knows where it is
+    const off = offsetDeg();
+    if (state.fix && !state.fix.local && off !== null && Math.abs(off) < hfov() / 2) state.fix = null;
+    return;
+  }
+  learnSign(state.prevFix, fix);
+  state.prevFix = fix; state.fix = fix; state.lastSeen = fix.at;
+  if (state.mode === "search" && !state.everSeen) { state.everSeen = true; tone(990, .08, .25, fix.m / 25); }
+}
+
+// AI path: one request in flight, back-to-back
+async function aiLoop(session) {
+  let last = 0;
+  while (session === state.session && state.mode !== "idle") {
+    const wait = AI_GAP_MS - (performance.now() - last);
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    if (session !== state.session) return;
+    last = performance.now();
+    const raw = rawYaw, W = 640, H = Math.round(W * video.videoHeight / video.videoWidth);
+    const c = document.createElement("canvas"); c.width = W; c.height = H;
+    c.getContext("2d").drawImage(video, 0, 0, W, H);
+    const image = c.toDataURL("image/jpeg", .7);
+    try {
+      const r = await fetch("/api/locate", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image, target: state.target }) });
+      const j = await r.json();
+      if (j.error) { if (session === state.session) { stopFind("Sorry, the server had a problem."); show(j.error); } return; }
+      accept(j.found ? { m: (j.x - .5) * hfov(), raw, at: performance.now(), local: false,
+        box: j.w ? { x: j.x - j.w / 2, y: j.y - j.h / 2, w: j.w, h: j.h } : null,
+        steps: j.steps, label: j.label || state.target, note: j.note } : null, session);
+    } catch (e) {
+      if (session === state.session) { stopFind("No connection. Try again."); }
+      return;
+    }
+  }
+}
+
+// on-device path for common objects
+let lastLocal = 0;
+function localDetect(now) {
+  if (!detector || !state.coco || now - lastLocal < LOCAL_EVERY || video.readyState < 2) return;
+  lastLocal = now;
+  const res = detector.detectForVideo(video, now);
+  let best = null;
+  for (const d of res.detections || []) {
+    const c = d.categories && d.categories[0];
+    if (c && c.categoryName === state.coco && (!best || c.score > best.score)) best = { score: c.score, b: d.boundingBox };
+  }
+  if (!best) { if (state.fix && state.fix.local && now - state.fix.at > 600) state.fix = null; return; }
+  const vw = video.videoWidth, vh = video.videoHeight, b = best.b;
+  const box = { x: b.originX / vw, y: b.originY / vh, w: b.width / vw, h: b.height / vh };
+  const realH = HEIGHT_M[state.coco] || .5;
+  const meters = realH / (box.h * 2 * Math.tan(vfov() * Math.PI / 360));
+  accept({ m: (box.x + box.w / 2 - .5) * hfov(), raw: rawYaw, at: now, local: true, box,
+    steps: Math.max(1, Math.round(meters / STEP_M)), label: state.target, note: "" }, state.session);
+}
+
+// ---------- guidance: beeps + announcements ----------
+let nextBeep = 0;
+function guide(now) {
+  if (state.mode === "idle") return;
+  const off = offsetDeg(), quiet = speaking() ? .35 : 1;
+
+  if (off === null) {
+    // nothing in view: slow low scanning tick
+    if (now >= nextBeep) { tone(330, .05, .12 * quiet); nextBeep = now + 1300; }
+    if (state.mode === "locked" && now - state.lastSeen > LOST_MS) {
+      state.mode = "search"; state.turned = 0; state.startedAt = now;
+      status("Finding " + state.target, "busy"); show("Finding: " + state.target);
+      say("Lost it. Turn slowly.");
+    }
+    if (state.mode === "search" && !state.lastSeen &&
+        ((gyroOK && state.turned > GIVE_UP_DEG) || now - state.startedAt > GIVE_UP_MS)) {
+      stopFind(`I can't find ${withArticle(state.target)} here. Try another spot, or ask for something else.`);
+      show("Not found: " + state.target);
+    }
+    return;
+  }
+
+  // in view: faster + higher as you face it, panned to its side
+  const a = Math.min(45, Math.abs(off));
+  if (now >= nextBeep) {
+    const centered = a < LOCK_DEG;
+    tone(centered ? 1320 : 600 + (1 - a / 45) * 500, centered ? .07 : .05, .28 * quiet, off / 25, centered ? "triangle" : "sine");
+    nextBeep = now + (centered ? 140 : 160 + (a / 45) * 600);
+  }
+
+  const f = state.fix;
+  if (a < LOCK_DEG) { if (!state.centeredSince) state.centeredSince = now; } else state.centeredSince = 0;
+
+  if (state.mode === "search" && state.centeredSince && now - state.centeredSince > LOCK_MS) {
+    state.mode = "locked"; state.lastDistSaid = now; state.lastSteps = f.steps;
+    chimeLock();
+    const dist = f.steps ? `, about ${f.steps} step${f.steps > 1 ? "s" : ""}` : "";
+    const line = `${cap(f.label)}, ahead${dist}.${f.note ? " " + f.note + "." : ""}`;
+    setTimeout(() => say(line), 350);
+    status("Facing it", "on"); show(`${cap(f.label)} · ${f.steps ? f.steps + " steps" : "ahead"}`, true);
+  }
+
+  if (state.mode === "locked" && f.steps) {
+    if (f.steps <= ARRIVE_STEPS) {
+      chimeArrive(); stopFind(`You're at the ${f.label}.`); show(`At the ${f.label}`, true); return;
+    }
+    if (now - state.lastDistSaid > 4000 && f.steps !== state.lastSteps && !speaking()) {
+      state.lastDistSaid = now; state.lastSteps = f.steps;
+      say(`${f.steps} step${f.steps > 1 ? "s" : ""}${a >= LOCK_DEG ? ", " + sideWords(off) : ""}.`, 1.15);
+      show(`${cap(f.label)} · ${f.steps} steps`, true);
+    }
+  }
+}
+const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
+
+function tellWhere() {
+  if (state.mode === "idle") {
+    if (state.lastTarget) { startFind(state.lastTarget); return; }
+    say("Hold the screen and say what you want to find."); return;
+  }
+  const off = offsetDeg(), f = state.fix;
+  if (off === null) { say(`Still looking for ${withArticle(state.target)}. Turn slowly.`); return; }
+  say(`${cap(f.label)}, ${sideWords(off)}${f.steps ? ", about " + f.steps + " steps" : ""}.`);
+}
+
+// ---------- drawing (for the person filming the demo) ----------
+function sizeCanvas() { cv.width = innerWidth * devicePixelRatio; cv.height = innerHeight * devicePixelRatio; }
+addEventListener("resize", sizeCanvas); sizeCanvas();
+function toScreen(x, y) {
+  const vw = video.videoWidth, vh = video.videoHeight, sw = cv.width, sh = cv.height;
+  const s = Math.max(sw / vw, sh / vh), ox = (sw - vw * s) / 2, oy = (sh - vh * s) / 2;
+  return { x: x * vw * s + ox, y: y * vh * s + oy, s: s };
+}
+function draw() {
+  cx.clearRect(0, 0, cv.width, cv.height);
+  if (state.mode === "idle" || !video.videoWidth) return;
+  const d = devicePixelRatio, off = offsetDeg(), locked = state.mode === "locked";
+  const color = locked ? "#30d158" : "#ffb000";
+  const f = state.fix;
+  if (f && f.box && off !== null) {
+    // shift the box by how far the user has turned since the photo
+    const shift = (f.m - off) / hfov();
+    const a = toScreen(f.box.x - shift, f.box.y), b = toScreen(f.box.x + f.box.w - shift, f.box.y + f.box.h);
+    cx.lineWidth = 5 * d; cx.strokeStyle = color; cx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y);
+  }
+  // direction bar along the top
+  const y = 80 * d, cxm = cv.width / 2, half = cv.width * .4;
+  cx.lineWidth = 3 * d; cx.strokeStyle = "rgba(255,255,255,.4)";
+  cx.beginPath(); cx.moveTo(cxm - half, y); cx.lineTo(cxm + half, y); cx.stroke();
+  cx.beginPath(); cx.moveTo(cxm, y - 14 * d); cx.lineTo(cxm, y + 14 * d); cx.stroke();
+  if (off !== null) {
+    const px = cxm + Math.max(-1, Math.min(1, off / 45)) * half;
+    cx.fillStyle = color; cx.beginPath(); cx.arc(px, y, 13 * d, 0, Math.PI * 2); cx.fill();
+  }
+}
+
+function loop() {
+  const now = performance.now();
+  if (state.mode !== "idle") { localDetect(now); guide(now); }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// ---------- start ----------
+$("go").onclick = async e => {
+  e.stopPropagation();
+  actx = new (window.AudioContext || window.webkitAudioContext)();
+  // iOS asks for motion permission; must be inside the tap
+  try {
+    if (window.DeviceMotionEvent && typeof DeviceMotionEvent.requestPermission === "function") {
+      const p = await DeviceMotionEvent.requestPermission();
+      if (p === "granted") addEventListener("devicemotion", onMotion);
+    } else addEventListener("devicemotion", onMotion);
+  } catch (err) {}
+  say("Starting camera.");
+  $("start").style.display = "none";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    video.srcObject = stream; await video.play();
+  } catch (err) { status("Camera blocked"); say("I can't open the camera. Check Safari camera permission."); return; }
+  status("Hold the screen to ask", "on");
+  say("Ready. Hold the screen and say what you want to find.");
+  loop();
+  // on-device detector loads in the background; until then everything goes to the AI
+  try {
+    const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    detector = await ObjectDetector.createFromOptions(fs, {
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite", delegate: "GPU" },
+      runningMode: "VIDEO", scoreThreshold: .35, maxResults: 6 });
+  } catch (err) { detector = null; }
+};
+
+// ---------- voice ----------
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null, heard = "";
+function startListening() {
+  if (!SR) { const q = prompt("Find what?"); if (q) route(q); return; }
+  speechSynthesis.cancel();
+  heard = ""; listening = true;
+  rec = new SR(); rec.lang = "en-US"; rec.interimResults = true; rec.continuous = true;
+  rec.onresult = ev => { heard = [...ev.results].map(r => r[0].transcript).join(" ").trim(); $("heard").textContent = "“" + heard + "”"; };
+  rec.onerror = ev => {
+    if (ev.error === "not-allowed" || ev.error === "service-not-allowed")
+      say("I can't use the microphone. Allow it in Safari, and turn on Dictation in iPhone settings.");
+  };
+  rec.onend = () => { if (listening) finishListening(); };
+  try { rec.start(); } catch (err) {}
+  $("listening").style.display = "block"; $("heard").textContent = "";
+  status("Listening", "mic"); tone(520, .08, .3);
+}
+function finishListening() {
+  listening = false; $("listening").style.display = "none";
+  try { rec && rec.stop(); } catch (err) {}
+  setTimeout(() => {
+    const q = heard.trim();
+    setTimeout(() => { $("heard").textContent = ""; }, 3000);
+    if (!q) { status(state.mode === "idle" ? "Hold the screen to ask" : "Finding " + state.target, state.mode === "idle" ? "on" : "busy");
+      say("I didn't catch that. Hold the screen and try again."); return; }
+    route(q);
+  }, 400);
+}
+function route(q) {
+  const s = q.toLowerCase().trim();
+  if (/^(stop|cancel|never ?mind|quit|end)\b/.test(s)) return stopFind("Stopped.");
+  if (/^(where is it|where|repeat|again)\b/.test(s) && state.mode !== "idle") return tellWhere();
+  startFind(q);
+}
+
+// ---------- press handling: short tap = where is it, long press = talk ----------
+let pressTimer = null, pressed = false;
+function down(e) {
+  if ($("start").style.display !== "none" || !video.videoWidth) return;
+  e.preventDefault(); pressed = true;
+  pressTimer = setTimeout(() => { pressTimer = null; startListening(); }, PRESS_MS);
+}
+function up() {
+  if (!pressed) return; pressed = false;
+  if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; tellWhere(); }
+  else if (listening) finishListening();
+}
+document.addEventListener("pointerdown", down);
+document.addEventListener("pointerup", up);
+document.addEventListener("pointercancel", up);
+
+// Desktop recording shortcuts: hold space = talk, Enter = where is it, Esc = stop
+document.addEventListener("keydown", e => {
+  if (!video.videoWidth || e.repeat) return;
+  if (e.key === " ") { e.preventDefault(); startListening(); }
+  if (e.key === "Enter") tellWhere();
+  if (e.key === "Escape") stopFind("Stopped.");
+});
+document.addEventListener("keyup", e => { if (e.key === " " && listening) finishListening(); });
+window.__find = { route, state }; // for testing from the console
+</script>
+</body>
+</html>
