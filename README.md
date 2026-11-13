@@ -9,9 +9,9 @@ Prototype 3 of the **Echo** body-interface project (IPD 5900, Penn). An iPhone w
 ## How it works
 
 1. **Hold the screen** and say what you want: "Find the door", "Where's a chair?", "Exit".
-2. **Turn slowly.** Beeps get faster and higher as you face it, and come from its side (stereo; AirPods work best).
-3. When you're facing it, a chime plays and a voice says, for example, "Glass door, ahead, about 4 steps. Door is closed."
-4. As you walk, it announces the steps left. A rising chime plays when you arrive.
+2. **Turn in a circle.** As soon as it's seen, a voice says "Found it. Turn left." Low beeps come from the ear on that side.
+3. When you're facing it, the beeps turn high and a voice says "Stop. Glass door, straight ahead, about 4 steps."
+4. Walk toward the high beeps. They speed up as you get closer. If you drift, you hear "A little left." A rising chime plays when you arrive.
 
 **Tap** to hear where it is now. Say **"stop"** to end. On a computer: hold Space to talk, Enter = where is it, Esc = stop.
 

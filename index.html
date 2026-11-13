@@ -47,8 +47,8 @@
   <h1>Find</h1>
   <ul>
     <li><b>Hold the screen</b> and say what you want: "Find the door", "Where's a chair?", "Exit".</li>
-    <li><b>Turn slowly.</b> Beeps get faster as you face it, and come from its side.</li>
-    <li>A chime and a voice tell you when you're facing it and how far it is.</li>
+    <li><b>Turn in a circle.</b> A voice says "turn left" or "turn right". Low beeps come from the side it's on; high beeps mean you're facing it.</li>
+    <li>Walk toward the high beeps. They speed up as you get closer.</li>
     <li><b>Tap</b> to hear where it is. Say <b>"stop"</b> to end.</li>
   </ul>
   <button id="go" aria-label="Start. Then hold the screen and say what you want to find.">Tap to start</button>
@@ -60,13 +60,14 @@ import { ObjectDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@m
 
 // ---------- tuning ----------
 const PRESS_MS = 350;        // press longer than this = talk, shorter = tap
-const LOCK_DEG = 7;          // within this many degrees = "facing it"
-const LOCK_MS = 700;         // must stay facing it this long before announcing
-const AI_GAP_MS = 150;       // pause between requests per worker (2 workers)
-const LOCAL_EVERY = 150;     // ms between on-device detections
+const LOCK_DEG = 9;          // within this many degrees = "facing it"
+const LOCK_MS = 350;         // must stay facing it this long before announcing
+const AI_GAP_MS = 100;       // pause between requests per worker (3 workers)
+const FAST_TURN = 130;       // deg/s: faster than this for a while = ask the user to slow down
+const LOCAL_EVERY = 80;     // ms between on-device detections
 const FIX_TTL_AI = 6000;     // trust an AI fix this long without gyro
 const FIX_TTL_GYRO = 20000;  // with gyro the bearing stays good much longer
-const MAX_TURN_FOR_PHOTO = 50; // deg/s: turning faster than this blurs the photo, so wait
+const MAX_TURN_FOR_PHOTO = 110; // deg/s: turning faster than this blurs the photo, so wait
 const TRACK_EVERY = 60;      // ms between on-device tracking steps (between AI answers)
 const FIX_TTL_LOCAL = 1500;
 const LOST_MS = 10000;       // no sighting this long while locked = lost
@@ -162,7 +163,9 @@ const state = {
   prevFix: null, lastSeen: 0, startedAt: 0, turned: 0,
   centeredSince: 0, lastSteps: null, lastDistSaid: 0, lastTarget: ""
 };
-const LONG_FOV = 64;
+let LONG_FOV = 64, wideCam = false;
+// angle (deg, + = right) of a horizontal position 0-1 in the frame
+function angOf(x) { return Math.atan((x - .5) * 2 * Math.tan(hfov() * Math.PI / 360)) * 180 / Math.PI; }
 function fovOf(px, longPx) { return 2 * Math.atan(Math.tan(LONG_FOV * Math.PI / 360) * px / longPx) * 360 / Math.PI; }
 function hfov() { const w = video.videoWidth || 4, h = video.videoHeight || 3; return fovOf(w, Math.max(w, h)); }
 function vfov() { const w = video.videoWidth || 4, h = video.videoHeight || 3; return fovOf(h, Math.max(w, h)); }
@@ -171,6 +174,15 @@ function offsetDeg() {   // where the target is now, relative to straight ahead 
   const ttl = f.local ? FIX_TTL_LOCAL : gyroOK ? FIX_TTL_GYRO : FIX_TTL_AI;
   if (performance.now() - f.at > ttl) return null;
   return (yawSign * f.raw + f.m) - yaw();
+}
+function turnWords(off) {   // what to do, in the fewest words
+  const a = Math.abs(off), s = off < 0 ? "left" : "right";
+  if (a < LOCK_DEG) return "straight ahead";
+  return a < 25 ? "a little " + s : a < 100 ? "turn " + s : "behind you, turn " + s;
+}
+function cue(text, gap, now, rate = 1.15) {   // short spoken hint, never interrupts speech
+  if (speaking() || now - (state.lastCue || 0) < gap) return false;
+  state.lastCue = now; say(text, rate); return true;
 }
 function sideWords(off) {
   const a = Math.abs(off);
@@ -185,9 +197,9 @@ function startFind(raw) {
   state.session++; track = null;
   Object.assign(state, { aiMisses: 0, mode: "search", target: t, coco: COCO[t] || COCO[t.replace(/s$/, "")] || null,
     fix: null, prevFix: null, lastSeen: 0, startedAt: performance.now(), turned: 0, centeredSince: 0,
-    lastSteps: null, lastDistSaid: 0, lastTarget: t, everSeen: false });
+    lastSteps: null, lastDistSaid: 0, lastTarget: t, everSeen: false, lastCue: 0, offSince: 0, fastSince: 0 });
   status("Finding " + t, "busy"); show("Finding: " + t);
-  say(`Looking for ${withArticle(t)}. Turn slowly.`);
+  say(`Looking for ${withArticle(t)}. Turn in a circle.`);
   if (!state.coco || !detector) aiLoop(state.session);
 }
 function stopFind(msg) {
@@ -221,8 +233,9 @@ function accept(fix, session) {
   const old = state.fix;
   if (old && !fix.local && fix.cap < (old.cap || 0)) return;          // older photo than what we have
   // smooth the distance
-  if (fix.steps && old && old.steps) fix.steps = Math.round((old.dist || old.steps) * .5 + fix.steps * .5);
-  fix.dist = fix.steps && old && old.dist ? old.dist * .5 + fix.steps * .5 : fix.steps;
+  const rawSteps = fix.steps;
+  fix.dist = rawSteps && old && old.dist ? old.dist * .5 + rawSteps * .5 : rawSteps;
+  fix.steps = fix.dist ? Math.max(1, Math.round(fix.dist)) : null;
   if (fix.box && (fix.box.h > .7 || fix.box.w > .8)) { fix.steps = 1; fix.dist = 1; }   // fills the view = you're there
   if (!fix.local && fix.snap) {
     // tracker already following it and agrees? keep tracker position, take the new size/distance/label
@@ -242,27 +255,32 @@ function accept(fix, session) {
     if (Math.abs(bNew - bOld) < 15) fix.m = (bOld * .4 + bNew * .6) - fix.raw;   // damp jumps
   }
   state.prevFix = fix; state.fix = fix; state.lastSeen = fix.at;
-  if (state.mode === "search" && !state.everSeen) { state.everSeen = true; tone(990, .08, .25, fix.m / 25); }
+  if (state.mode === "search" && !state.everSeen) {
+    state.everSeen = true;
+    const off = offsetDeg();
+    tone(990, .1, .4); tone(1320, .12, .4, 0, "sine", .1);
+    if (off !== null && Math.abs(off) >= LOCK_DEG) { state.lastCue = performance.now(); setTimeout(() => say("Found it. " + cap(turnWords(off)) + "."), 250); }
+  }
 }
 
 // AI path: two workers, staggered, so a fresh answer lands about every half second
-function aiLoop(session) { aiWorker(session); setTimeout(() => aiWorker(session), 450); }
+function aiLoop(session) { aiWorker(session); setTimeout(() => aiWorker(session), 300); setTimeout(() => aiWorker(session), 600); }
 async function aiWorker(session) {
   while (session === state.session && state.mode !== "idle") {
     // a photo taken mid-swing is blurry; wait (up to 0.4 s) for the turn to slow down
-    for (let t = 0; t < 4 && gyroOK && turnRate > MAX_TURN_FOR_PHOTO; t++) await new Promise(r => setTimeout(r, 100));
+    for (let t = 0; t < 2 && gyroOK && turnRate > MAX_TURN_FOR_PHOTO; t++) await new Promise(r => setTimeout(r, 100));
     if (session !== state.session) return;
-    const cap = performance.now(), raw = rawYaw, W = 640, H = Math.round(W * video.videoHeight / video.videoWidth);
+    const cap = performance.now(), raw = rawYaw, W = wideCam ? 640 : 512, H = Math.round(W * video.videoHeight / video.videoWidth);
     const c = document.createElement("canvas"); c.width = W; c.height = H;
     c.getContext("2d").drawImage(video, 0, 0, W, H);
     const snap = graySnap(c);
-    const image = c.toDataURL("image/jpeg", .7);
+    const image = c.toDataURL("image/jpeg", .65);
     try {
       const r = await fetch("/api/locate", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image, target: state.target }) });
       const j = await r.json();
       if (j.error) { if (session === state.session) { stopFind("Sorry, the server had a problem."); show(j.error); } return; }
-      accept(j.found ? { m: (j.x - .5) * hfov(), raw, cap, snap, at: performance.now(), local: false,
+      accept(j.found ? { m: angOf(j.x), raw, cap, snap, at: performance.now(), local: false,
         box: j.w ? { x: j.x - j.w / 2, y: j.y - j.h / 2, w: j.w, h: j.h } : null,
         steps: j.steps, label: j.label || state.target, note: j.note } : null, session);
     } catch (e) {
@@ -339,7 +357,7 @@ function trackStep(now) {
   const np = patch(sn, bx, by, tr.tw, tr.th);
   if (np) for (let i = 0; i < np.length; i++) tr.tpl[i] = tr.tpl[i] * .85 + np[i] * .15;
   const f = state.fix;
-  f.m = (bx / sn.w - .5) * hfov(); f.raw = yaw(); f.at = now; state.lastSeen = now;
+  f.m = angOf(bx / sn.w); f.raw = yaw(); f.at = now; state.lastSeen = now;
   if (f.box) { f.box = { ...f.box, x: bx / sn.w - f.box.w / 2, y: by / sn.h - f.box.h / 2 }; }
 }
 
@@ -359,7 +377,7 @@ function localDetect(now) {
   const box = { x: b.originX / vw, y: b.originY / vh, w: b.width / vw, h: b.height / vh };
   const realH = HEIGHT_M[state.coco] || .5;
   const meters = realH / (box.h * 2 * Math.tan(vfov() * Math.PI / 360));
-  accept({ m: (box.x + box.w / 2 - .5) * hfov(), raw: rawYaw, cap: now, at: now, local: true, box,
+  accept({ m: angOf(box.x + box.w / 2), raw: rawYaw, cap: now, at: now, local: true, box,
     steps: Math.max(1, Math.round(meters / STEP_M)), label: state.target, note: "" }, state.session);
 }
 
@@ -367,58 +385,71 @@ function localDetect(now) {
 let nextBeep = 0;
 function guide(now) {
   if (state.mode === "idle") return;
-  const off = offsetDeg(), quiet = speaking() ? .35 : 1;
+  const off = offsetDeg(), quiet = speaking() ? .3 : 1;
 
   if (off === null) {
-    // nothing in view: slow low scanning tick
-    if (now >= nextBeep) { tone(330, .05, .12 * quiet); nextBeep = now + 1300; }
+    // not seen yet: soft low tick so you know it's working
+    if (now >= nextBeep) { tone(330, .05, .15 * quiet); nextBeep = now + 1200; }
     if (state.mode === "locked" && now - state.lastSeen > LOST_MS) {
-      state.mode = "search"; state.turned = 0; state.startedAt = now;
+      state.mode = "search"; state.turned = 0; state.startedAt = now; state.everSeen = false;
       status("Finding " + state.target, "busy"); show("Finding: " + state.target);
-      say("Lost it. Turn slowly.");
+      say("Lost it. Turn in a circle again.");
     }
     if (state.mode === "search" && !state.lastSeen &&
-        ((gyroOK && state.turned > GIVE_UP_DEG) || now - state.startedAt > GIVE_UP_MS)) {
+        ((gyroOK && state.turned > GIVE_UP_DEG * 1.5) || now - state.startedAt > GIVE_UP_MS)) {
       stopFind(`I can't find ${withArticle(state.target)} here. Try another spot, or ask for something else.`);
       show("Not found: " + state.target);
+    } else if (state.mode === "search") {
+      if (gyroOK && turnRate > FAST_TURN) {
+        if (!state.fastSince) state.fastSince = now;
+        else if (now - state.fastSince > 700) cue("A little slower.", 5000, now);
+      } else state.fastSince = 0;
+      if (now - state.startedAt > 7000) cue("Keep turning.", 7000, now);
     }
     return;
   }
 
-  // in view: faster + higher as you face it, panned to its side
-  const a = Math.min(45, Math.abs(off)), f = state.fix;
+  const a = Math.abs(off), f = state.fix, centered = a < LOCK_DEG, locked = state.mode === "locked";
+  // Beeps. Off target: low beeps in the ear on that side, rising as you get closer to facing it.
+  // On target: bright high beeps in both ears. Once locked, on-target beeps speed up as you walk closer.
   if (now >= nextBeep) {
-    const centered = a < LOCK_DEG;
-    const seenRecently = now - state.lastSeen < 2000;   // otherwise only the gyro is holding it: softer
-    const vol = (seenRecently ? .28 : .14) * quiet;
-    tone(centered ? 1320 : 600 + (1 - a / 45) * 500, centered ? .07 : .05, vol, off / 25, centered ? "triangle" : "sine");
-    if (state.mode === "locked") {
-      // parking-sensor style: closer = faster; drifting off-centre adds a little delay
+    const vol = (now - state.lastSeen < 2500 ? .4 : .22) * quiet;
+    const k = Math.min(a, 90) / 90;
+    if (centered) tone(1320, .07, vol, 0, "triangle");
+    else tone(420 + (1 - k) * 380, .07, vol, off > 0 ? 1 : -1, "sine");
+    if (centered && locked) {
       const d = Math.max(1, Math.min(10, f.dist || f.steps || 6));
-      nextBeep = now + 110 + (d - 1) / 9 * 650 + (centered ? 0 : 120);
-    } else nextBeep = now + (centered ? 140 : 160 + (a / 45) * 600);
+      nextBeep = now + 110 + (d - 1) / 9 * 650;
+    } else nextBeep = now + (centered ? 140 : 200 + k * 500);
   }
 
-  if (a < LOCK_DEG) { if (!state.centeredSince) state.centeredSince = now; } else state.centeredSince = 0;
+  if (centered) { if (!state.centeredSince) state.centeredSince = now; state.offSince = 0; }
+  else { state.centeredSince = 0; if (!state.offSince) state.offSince = now; }
 
-  if (state.mode === "search" && state.centeredSince && now - state.centeredSince > LOCK_MS) {
-    state.mode = "locked"; state.lastDistSaid = now; state.lastSteps = f.steps;
-    chimeLock();
-    const dist = f.steps ? `, about ${f.steps} step${f.steps > 1 ? "s" : ""}` : "";
-    const line = `${cap(f.label)}, ahead${dist}.${f.note ? " " + f.note + "." : ""}`;
-    setTimeout(() => say(line), 350);
-    status("Facing it", "on"); show(`${cap(f.label)} · ${f.steps ? f.steps + " steps" : "ahead"}`, true);
+  if (!locked) {
+    if (state.centeredSince && now - state.centeredSince > LOCK_MS) {
+      state.mode = "locked"; state.lastDistSaid = now; state.lastSteps = f.steps; state.lastCue = now;
+      chimeLock();
+      const dist = f.steps ? `, about ${f.steps} step${f.steps > 1 ? "s" : ""}` : "";
+      const line = `Stop. ${cap(f.label)}, straight ahead${dist}.${f.note ? " " + f.note + "." : ""}`;
+      setTimeout(() => say(line), 300);
+      status("Facing it", "on"); show(`${cap(f.label)} · ${f.steps ? f.steps + " steps" : "ahead"}`, true);
+    } else if (!centered && now - state.offSince > 400) {
+      cue(cap(turnWords(off)) + ".", 2500, now);
+    }
+    return;
   }
 
-  if (state.mode === "locked" && f.steps) {
-    if ((f.dist || f.steps) <= ARRIVE_STEPS + .3) {
-      chimeArrive(); stopFind(`You're at the ${f.label}.`); show(`At the ${f.label}`, true); return;
-    }
-    if (now - state.lastDistSaid > 4000 && f.steps !== state.lastSteps && !speaking()) {
-      state.lastDistSaid = now; state.lastSteps = f.steps;
-      say(`${f.steps} step${f.steps > 1 ? "s" : ""}${a >= LOCK_DEG ? ", " + sideWords(off) : ""}.`, 1.15);
-      show(`${cap(f.label)} · ${f.steps} steps`, true);
-    }
+  // locked: walking toward it
+  if (f.steps && (f.dist || f.steps) <= ARRIVE_STEPS + .3) {
+    chimeArrive(); stopFind(`You're at the ${f.label}.`); show(`At the ${f.label}`, true); return;
+  }
+  if (!centered && now - state.offSince > 500) {
+    if (cue(cap(turnWords(off)) + ".", 2500, now)) status(cap(turnWords(off)), "busy");
+  } else if (centered && f.steps && now - state.lastDistSaid > 4000 && f.steps !== state.lastSteps && !speaking()) {
+    state.lastDistSaid = now; state.lastSteps = f.steps; state.lastCue = now;
+    say(`${f.steps} step${f.steps > 1 ? "s" : ""}.`, 1.15);
+    status("Facing it", "on"); show(`${cap(f.label)} · ${f.steps} steps`, true);
   }
 }
 const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
@@ -472,6 +503,22 @@ function loop() {
   requestAnimationFrame(loop);
 }
 
+// Use the phone's ultra-wide back camera when it has one. Add ?wide=0 to the URL to turn this off.
+async function tryUltraWide() {
+  if (/[?&]wide=0/.test(location.search)) return;
+  try {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const uw = devs.find(d => d.kind === "videoinput" && /ultra|超广角/i.test(d.label) && !/front|前置/i.test(d.label));
+    if (!uw) return;
+    const s2 = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: { exact: uw.deviceId }, width: { ideal: 1280 }, height: { ideal: 960 }, aspectRatio: { ideal: 4 / 3 } }, audio: false });
+    stream.getTracks().forEach(t => t.stop());
+    stream = s2; video.srcObject = s2; await video.play();
+    s2.getVideoTracks()[0].addEventListener("unmute", () => video.play().catch(() => {}));
+    LONG_FOV = 104; wideCam = true;
+  } catch (e) {}
+}
+
 // ---------- start ----------
 $("go").onclick = async e => {
   e.stopPropagation();
@@ -491,6 +538,7 @@ $("go").onclick = async e => {
     video.muted = true; video.srcObject = stream; await video.play();
     video.addEventListener("pause", () => video.play().catch(() => {}));
     stream.getVideoTracks()[0].addEventListener("unmute", () => video.play().catch(() => {}));
+    await tryUltraWide();
   } catch (err) { status("Camera blocked"); say("I can't open the camera. Check Safari camera permission."); return; }
   status("Hold the screen to ask", "on");
   say("Ready. Hold the screen and say what you want to find.");
