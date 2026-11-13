@@ -50,6 +50,7 @@ module.exports = async function handler(req, res) {
   if (!target) return res.status(400).json({ error: "target is required" });
 
   try {
+    const t0 = Date.now();
     const r = await fetch("https://api.deepseek.com/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
@@ -78,6 +79,7 @@ module.exports = async function handler(req, res) {
     const steps = Number(j.steps);
     return res.status(200).json({
       found,
+      ms: Date.now() - t0,
       x: found ? x : null,
       y: found ? y : null,
       w: found ? clamp01(j.w) : null,
