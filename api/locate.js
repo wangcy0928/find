@@ -5,26 +5,29 @@
 // Env: DEEPSEEK_API_KEY (required), DEEPSEEK_MODEL (optional, default deepseek-flash)
 
 const PROMPT = (target) =>
-  "You are the eyes of a blind person who is turning slowly to find something. " +
+  "You are the eyes of a blind person who is turning to find something. " +
   `They are looking for: "${target}". ` +
-  "Look at the photo and answer with ONE JSON object and nothing else:\n" +
-  '{"found": true|false, "conf": 0-1, "x": 0-1, "y": 0-1, "w": 0-1, "h": 0-1, "steps": number|null, "label": "...", "note": "..."}\n' +
-  "- found: true if that thing (or an obvious match, e.g. an EXIT sign for 'exit', a doorway for 'door') is visible, " +
-  "even if small, far away, partly cut off at the edge, slightly blurry, or so close it fills most of the view.\n" +
-  "- conf: how sure you are it is the right thing (0-1).\n" +
-  "- x, y: centre of the thing as a fraction of image width / height (0 = left/top, 1 = right/bottom).\n" +
-  "- w, h: its size as a fraction of image width / height.\n" +
-  "- steps: walking distance in normal steps (1 step = 0.7 m). Judge from its size in the image (a door filling the height is 1-2 steps; a door half the image height is about 4-5 steps). Never null if found.\n" +
-  "- label: 1-4 words naming exactly what you found, e.g. \"glass door\", \"EXIT sign\", \"Room 706 door\".\n" +
-  "- note: at most 8 words that matter for reaching it (\"two steps down first\", \"door is closed\"), or \"\".\n" +
-  "If it is not visible, return {\"found\": false, \"note\": \"\"}. If there are several, pick the nearest.";
+  "If that thing (or an obvious match, e.g. an EXIT sign for 'exit', a doorway for 'door') is visible in the photo, " +
+  "even if small, far away, partly cut off at the edge, a bit blurry, or so close it fills the view, " +
+  "reply with ONE line and nothing else, in this format:\n" +
+  "x,y,w,h,steps,label\n" +
+  "x,y = its centre as fractions of image width and height (0 = left/top, 1 = right/bottom). " +
+  "w,h = its size as fractions of image width and height. " +
+  "steps = walking distance in steps of 0.7 m, judged from its size (a door filling the height is 1-2 steps; half the height is 4-5). " +
+  "label = 1-4 words naming exactly what you found.\n" +
+  "Example: 0.72,0.45,0.20,0.60,4,glass door\n" +
+  "If it is not visible, reply exactly: NO\n" +
+  "If there are several, pick the nearest.";
 
 function clamp01(v) { v = Number(v); return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : null; }
 
 function parse(text) {
-  const m = String(text || "").match(/\{[\s\S]*\}/);
-  if (!m) return null;
-  try { return JSON.parse(m[0]); } catch { return null; }
+  const t = String(text || "").trim();
+  const m = t.match(/(-?\d*\.?\d+)\s*,\s*(-?\d*\.?\d+)\s*,\s*(-?\d*\.?\d+)\s*,\s*(-?\d*\.?\d+)\s*,\s*(-?\d*\.?\d+)?\s*,?\s*([^\n]*)/);
+  if (m) return { found: true, x: m[1], y: m[2], w: m[3], h: m[4], steps: m[5], label: m[6].replace(/["'`.]/g, "").trim() };
+  const j = t.match(/\{[\s\S]*\}/);          // tolerate a JSON answer too
+  if (j) { try { return JSON.parse(j[0]); } catch {} }
+  return { found: false };
 }
 
 module.exports = async function handler(req, res) {
@@ -53,7 +56,7 @@ module.exports = async function handler(req, res) {
       body: JSON.stringify({
         model: process.env.DEEPSEEK_MODEL || "deepseek-flash",
         thinking: { type: "disabled" },
-        max_tokens: 120,
+        max_tokens: 40,
         temperature: 0.1,
         messages: [{
           role: "user",
@@ -71,12 +74,10 @@ module.exports = async function handler(req, res) {
     const raw = data.choices && data.choices[0] && data.choices[0].message.content;
     const j = parse(raw) || {};
     const x = clamp01(j.x), y = clamp01(j.y);
-    const conf = Number.isFinite(Number(j.conf)) ? Number(j.conf) : (j.found ? .6 : 0);
-    const found = !!j.found && conf >= .35 && x !== null && y !== null;
+    const found = !!j.found && x !== null && y !== null;
     const steps = Number(j.steps);
     return res.status(200).json({
       found,
-      conf: Math.round(conf * 100) / 100,
       x: found ? x : null,
       y: found ? y : null,
       w: found ? clamp01(j.w) : null,

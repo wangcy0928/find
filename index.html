@@ -33,7 +33,7 @@
   #start li { margin:6px 0; } #start b { color:#fff; }
   #start button { font-size:26px; font-weight:700; padding:28px 0; width:100%; max-width:340px;
     border-radius:22px; border:none; background:var(--amber); color:#000; }
-  #foot { position:fixed; bottom:4px; width:100%; text-align:center; font-size:10px; color:#888; pointer-events:none; }
+  #foot { position:fixed; bottom:4px; width:100%; text-align:center; font-size:10px; color:#aaa; pointer-events:none; text-shadow:0 1px 2px #000; }
 </style>
 </head>
 <body>
@@ -96,18 +96,24 @@ const HEIGHT_M = { person:1.7, chair:.9, "dining table":.75, couch:.8, bench:.8,
 const $ = id => document.getElementById(id);
 const video = $("cam"), cv = $("fx"), cx = cv.getContext("2d");
 let actx, detector = null, listening = false, stream = null, lastFrameAt = 0, lastVT = -1, lastKick = 0;
-// iOS Safari can pause/freeze the camera preview when speech starts. Keep it running.
+// iOS Safari can pause the camera preview when speech starts. Nudge it; re-attach only as a last resort.
+function watchFrames() {
+  if (!video.requestVideoFrameCallback) return;
+  const tick = () => { lastFrameAt = performance.now(); video.requestVideoFrameCallback(tick); };
+  video.requestVideoFrameCallback(tick);
+}
 function cameraWatchdog(now) {
   if (!stream) return;
-  if (video.currentTime !== lastVT) { lastVT = video.currentTime; lastFrameAt = now; return; }
+  if (!video.requestVideoFrameCallback && video.currentTime !== lastVT) { lastVT = video.currentTime; lastFrameAt = now; }
+  if (!lastFrameAt) { lastFrameAt = now; return; }
   const stuck = now - lastFrameAt;
-  if (stuck > 400 && now - lastKick > 400) {
+  if (stuck > 600 && now - lastKick > 1000) {
     lastKick = now;
-    if (stuck > 1500) { video.srcObject = null; video.srcObject = stream; }
+    if (stuck > 4000) { video.srcObject = null; video.srcObject = stream; watchFrames(); lastFrameAt = now; }
     video.muted = true; video.play().catch(() => {});
   }
 }
-
+const stats = { aiMs: 0, aiN: 0, last: "-", frames: 0, fps: 0, at: 0 };
 function status(t, cls) { $("statusText").textContent = t; $("dot").className = cls || ""; }
 function show(text, locked) {
   const a = $("answer"); a.textContent = text; a.className = locked ? "locked" : ""; a.style.display = text ? "block" : "none";
@@ -266,19 +272,22 @@ function accept(fix, session) {
 // AI path: two workers, staggered, so a fresh answer lands about every half second
 function aiLoop(session) { aiWorker(session); setTimeout(() => aiWorker(session), 300); setTimeout(() => aiWorker(session), 600); }
 async function aiWorker(session) {
+  const c = document.createElement("canvas"), g = c.getContext("2d");
   while (session === state.session && state.mode !== "idle") {
     // a photo taken mid-swing is blurry; wait (up to 0.4 s) for the turn to slow down
     for (let t = 0; t < 2 && gyroOK && turnRate > MAX_TURN_FOR_PHOTO; t++) await new Promise(r => setTimeout(r, 100));
     if (session !== state.session) return;
-    const cap = performance.now(), raw = rawYaw, W = wideCam ? 640 : 512, H = Math.round(W * video.videoHeight / video.videoWidth);
-    const c = document.createElement("canvas"); c.width = W; c.height = H;
-    c.getContext("2d").drawImage(video, 0, 0, W, H);
+    const cap = performance.now(), raw = rawYaw, W = wideCam ? 576 : 448, H = Math.round(W * video.videoHeight / video.videoWidth);
+    if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
+    g.drawImage(video, 0, 0, W, H);
     const snap = graySnap(c);
-    const image = c.toDataURL("image/jpeg", .65);
+    const image = c.toDataURL("image/jpeg", .6);
     try {
       const r = await fetch("/api/locate", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image, target: state.target }) });
       const j = await r.json();
+      const ms = performance.now() - cap; stats.aiMs = stats.aiMs ? stats.aiMs * .7 + ms * .3 : ms; stats.aiN++;
+      stats.last = j.error ? "error" : j.found ? "seen" : "not seen";
       if (j.error) { if (session === state.session) { stopFind("Sorry, the server had a problem."); show(j.error); } return; }
       accept(j.found ? { m: angOf(j.x), raw, cap, snap, at: performance.now(), local: false,
         box: j.w ? { x: j.x - j.w / 2, y: j.y - j.h / 2, w: j.w, h: j.h } : null,
@@ -465,7 +474,8 @@ function tellWhere() {
 }
 
 // ---------- drawing (for the person filming the demo) ----------
-function sizeCanvas() { cv.width = innerWidth * devicePixelRatio; cv.height = innerHeight * devicePixelRatio; }
+const DPR = Math.min(1.5, devicePixelRatio || 1);
+function sizeCanvas() { cv.width = innerWidth * DPR; cv.height = innerHeight * DPR; }
 addEventListener("resize", sizeCanvas); sizeCanvas();
 function toScreen(x, y) {
   const vw = video.videoWidth, vh = video.videoHeight, sw = cv.width, sh = cv.height;
@@ -475,7 +485,7 @@ function toScreen(x, y) {
 function draw() {
   cx.clearRect(0, 0, cv.width, cv.height);
   if (state.mode === "idle" || !video.videoWidth) return;
-  const d = devicePixelRatio, off = offsetDeg(), locked = state.mode === "locked";
+  const d = DPR, off = offsetDeg(), locked = state.mode === "locked";
   const color = locked ? "#30d158" : "#ffb000";
   const f = state.fix;
   if (f && f.box && off !== null) {
@@ -495,11 +505,23 @@ function draw() {
   }
 }
 
+let lastDraw = 0;
 function loop() {
   const now = performance.now();
   cameraWatchdog(now);
-  if (state.mode !== "idle") { localDetect(now); trackStep(now); guide(now); }
-  draw();
+  if (state.mode !== "idle") {
+    let t = performance.now(); localDetect(now); let cost = performance.now() - t;
+    if (cost > 8) lastLocal = now + cost * 2;          // slow phone: detect less often
+    t = performance.now(); trackStep(now); cost = performance.now() - t;
+    if (cost > 6) lastTrack = now + cost * 3;
+    guide(now);
+  }
+  if (now - lastDraw > 66) { lastDraw = now; draw(); }
+  stats.frames++;
+  if (now - stats.at > 1000) {
+    stats.fps = Math.round(stats.frames * 1000 / (now - stats.at)); stats.frames = 0; stats.at = now;
+    $("foot").textContent = `${wideCam ? "wide" : "normal"} cam · motion ${gyroOK ? "on" : "OFF"} · AI ${stats.aiMs ? Math.round(stats.aiMs) + " ms" : "-"} · ${stats.last} · ${stats.fps} fps · v5`;
+  }
   requestAnimationFrame(loop);
 }
 
@@ -511,7 +533,7 @@ async function tryUltraWide() {
     const uw = devs.find(d => d.kind === "videoinput" && /ultra|超广角/i.test(d.label) && !/front|前置/i.test(d.label));
     if (!uw) return;
     const s2 = await navigator.mediaDevices.getUserMedia({
-      video: { deviceId: { exact: uw.deviceId }, width: { ideal: 1280 }, height: { ideal: 960 }, aspectRatio: { ideal: 4 / 3 } }, audio: false });
+      video: { deviceId: { exact: uw.deviceId }, width: { ideal: 960 }, height: { ideal: 720 }, aspectRatio: { ideal: 4 / 3 } }, audio: false });
     stream.getTracks().forEach(t => t.stop());
     stream = s2; video.srcObject = s2; await video.play();
     s2.getVideoTracks()[0].addEventListener("unmute", () => video.play().catch(() => {}));
@@ -534,11 +556,12 @@ $("go").onclick = async e => {
   $("start").style.display = "none";
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 960 }, aspectRatio: { ideal: 4 / 3 } }, audio: false });
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 960 }, height: { ideal: 720 }, aspectRatio: { ideal: 4 / 3 } }, audio: false });
     video.muted = true; video.srcObject = stream; await video.play();
     video.addEventListener("pause", () => video.play().catch(() => {}));
     stream.getVideoTracks()[0].addEventListener("unmute", () => video.play().catch(() => {}));
     await tryUltraWide();
+    watchFrames();
   } catch (err) { status("Camera blocked"); say("I can't open the camera. Check Safari camera permission."); return; }
   status("Hold the screen to ask", "on");
   say("Ready. Hold the screen and say what you want to find.");
