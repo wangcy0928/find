@@ -1,1 +1,1 @@
-{ "regions": ["hkg1"], "functions": { "api/locate.js": { "maxDuration": 30 } } }
+{ "functions": { "api/locate.js": { "maxDuration": 30 } } }
